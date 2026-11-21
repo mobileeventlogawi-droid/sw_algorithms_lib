@@ -1,6 +1,7 @@
 project(sw_sensor_algorithms)
 
 set(SOURCE_FILES
+    Generic_Algorithms/microphone_analysis.cpp
     Generic_Algorithms/serial_io.cpp
     NAV_Algorithms/AHRS.cpp
     NAV_Algorithms/air_density_observer.cpp

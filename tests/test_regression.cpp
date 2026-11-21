@@ -209,6 +209,12 @@ static void test_microphone_analysis( void)
 	all_bands_ok = false;
     }
   check( all_bands_ok, "microphone: all third-octave bands calibrated");
+
+  // the decimators must keep frequencies above an octave's band from
+  // folding into it: 3 kHz would alias to 1 kHz at a 4 kHz rate
+  r = microphone_tone( 3000.0f, 0.5f);
+  check( r.band_dBFS[MIC_BAND_1KHZ] < -6.0f - 30.0f && r.band_dBFS[MIC_BAND_1KHZ - 3] < -6.0f - 30.0f,
+	 "microphone: no aliasing into lower octaves");
 }
 
 int main( void)
