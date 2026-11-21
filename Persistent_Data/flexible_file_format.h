@@ -14,6 +14,7 @@
 
     BASIC_SENSOR_DATA = 20, 	//!< IMU-data, pressures, temperature
     MAGNETOMETER_DATA = 21,	//!< external magnetometer readings
+    MICROPHONE_DATA = 22,	//!< ENL and band levels, microphone_record_t, 4 Hz
 
     GNSS_DATA   = 30,		//!< abstract GNSS receiver output
     D_GNSS_DATA = 31,		//!< abstract D-GNSS receiver output

@@ -38,6 +38,7 @@ set(HEADER_FILES
     Generic_Algorithms/Linear_Least_Square_Fit.h
     Generic_Algorithms/matrix.h
     Generic_Algorithms/mean_and_variance_finder.h
+    Generic_Algorithms/microphone_analysis.h
     Generic_Algorithms/pt2.h
     Generic_Algorithms/quaternion.h
     Generic_Algorithms/ringbuffer.h
