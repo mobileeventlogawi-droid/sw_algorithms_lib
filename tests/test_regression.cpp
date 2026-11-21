@@ -194,8 +194,21 @@ static void test_microphone_analysis( void)
 
   r = microphone_tone( 1000.0f, 0.5f); // -6 dBFS
   check( fabsf( r.broadband_dBFS + 6.0f) < 0.3f, "microphone: broadband level");
-  check( fabsf( r.octave_dBFS[5] + 6.0f) < 0.5f, "microphone: 1 kHz octave band level");
-  check( r.octave_dBFS[3] < -20.0f && r.octave_dBFS[6] < -10.0f, "microphone: octave band selectivity");
+  check( fabsf( r.peak_dBFS + 6.0f) < 0.1f, "microphone: peak level");
+  check( fabsf( r.band_dBFS[MIC_BAND_1KHZ] + 6.0f) < 0.3f, "microphone: 1 kHz band level");
+  check( r.band_dBFS[MIC_BAND_1KHZ - 1] < -6.0f - 15.0f && r.band_dBFS[MIC_BAND_1KHZ + 1] < -6.0f - 15.0f,
+	 "microphone: neighbour bands attenuated");
+  check( r.record_count == 10, "microphone: record counter");
+
+  // every band at its own center frequency, lowest and highest included
+  bool all_bands_ok = true;
+  for( unsigned i = 0; i < MIC_BANDS; ++i)
+    {
+      microphone_record_t b = microphone_tone( microphone_analysis_t::band_center_frequency( i), 0.1f); // -20 dBFS
+      if( fabsf( b.band_dBFS[i] + 20.0f) > 0.3f)
+	all_bands_ok = false;
+    }
+  check( all_bands_ok, "microphone: all third-octave bands calibrated");
 }
 
 int main( void)

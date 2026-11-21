@@ -43,20 +43,26 @@
 // 0.03544), i.e. 94 dB SPL with the ICS-43434's sensitivity.
 #define ENL_DEFAULT_GAIN		(890.0f / 0.03544f)
 
-#define MIC_OCTAVE_BANDS		7	// 31.5 Hz .. 2 kHz
-#define MIC_OCTAVE_Q			1.414f	// one octave bandwidth
+// third-octave bands, base-2 centers 1000 Hz * 2^(k/3): 24.8 Hz .. 2520 Hz
+// (nominal 25 .. 2500 Hz), the highest band edge stays below fs/2
+#define MIC_BANDS			21
+#define MIC_BAND_1KHZ			16	// index of the 1 kHz band
+#define MIC_BAND_SECTIONS		3	// 6th order Butterworth band-pass
 
 #define MIC_STATUS_NO_SIGNAL		0x0001	// constant samples: microphone missing or stuck
 #define MIC_STATUS_LOST_BLOCKS_SHIFT	16	// DMA blocks not processed in time (set by driver)
 
-//! LRSX record MICROPHONE_DATA, 11 words
+//! LRSX record MICROPHONE_DATA, 27 words. Levels in dBFS: 0 dBFS = sine
+//! with full-scale peak.
 typedef struct
 {
+  uint32_t record_count;		//!< +1 per record, shows gaps
   uint32_t ENL;				//!< 0..999, 1 s window
   uint32_t status;			//!< MIC_STATUS_xxx
-  float ENL_band_dBFS;			//!< ENL filter output, 250 ms window
-  float broadband_dBFS;			//!< DC removed, 250 ms window
-  float octave_dBFS[MIC_OCTAVE_BANDS];	//!< 31.5 .. 2000 Hz, 250 ms window
+  float ENL_band_dBFS;			//!< ENL filter output, 250 ms RMS
+  float broadband_dBFS;			//!< DC removed, 250 ms RMS
+  float peak_dBFS;			//!< largest raw sample in 250 ms, 0 = clipping
+  float band_dBFS[MIC_BANDS];		//!< third-octave bands, 250 ms RMS
 } microphone_record_t;
 
 //! RBJ band-pass (0 dB peak gain), direct form I: robust in float for
@@ -89,26 +95,119 @@ private:
   float x1, x2, y1, y2;
 };
 
+//! Third-octave band-pass: 3rd order Butterworth low-pass prototype,
+//! low-pass to band-pass transform, bilinear transform (band edges
+//! prewarped). Every section has the numerator 1 - z^-2; the overall gain
+//! is applied to the mean square only, saving a multiplication per sample.
+//! Cascaded direct form I sections share their state between neighbours.
+class mic_third_octave_t
+{
+public:
+  void setup (float center, float fs)
+  {
+    struct cplx
+    {
+      float re, im;
+      cplx operator+ (cplx b) const { return { re + b.re, im + b.im }; }
+      cplx operator- (cplx b) const { return { re - b.re, im - b.im }; }
+      cplx operator* (cplx b) const { return { re * b.re - im * b.im, re * b.im + im * b.re }; }
+      cplx operator/ (cplx b) const
+      {
+	float d = b.re * b.re + b.im * b.im;
+	return { (re * b.re + im * b.im) / d, (im * b.re - re * b.im) / d };
+      }
+      cplx root (void) const
+      {
+	float r = sqrtf (hypotf (re, im)), phi = atan2f (im, re) / 2.0f;
+	return { r * cosf (phi), r * sinf (phi) };
+      }
+    };
+
+    // edges of the third-octave band, prewarped for the bilinear transform
+    float w1 = tanf ((float) M_PI * center / powf (2.0f, 1.0f / 6.0f) / fs);
+    float w2 = tanf ((float) M_PI * center * powf (2.0f, 1.0f / 6.0f) / fs);
+    float w0 = sqrtf (w1 * w2);
+    float bw = w2 - w1;
+
+    // upper half-plane band-pass poles: two from the prototype pole at
+    // 120 degrees, one from the real prototype pole
+    cplx p_complex = { cosf (2.0f * (float) M_PI / 3.0f) * bw / 2.0f, sinf (2.0f * (float) M_PI / 3.0f) * bw / 2.0f };
+    cplx p_real = { -bw / 2.0f, 0.0f };
+    cplx w0_squared = { w0 * w0, 0.0f };
+    cplx d = (p_complex * p_complex - w0_squared).root ();
+    cplx poles[MIC_BAND_SECTIONS] = { p_complex + d, p_complex - d, p_real + (p_real * p_real - w0_squared).root () };
+
+    // section response at the center frequency to normalize the gain
+    float omega0 = 2.0f * atanf (w0);
+    cplx z_inv = { cosf (omega0), -sinf (omega0) };
+    cplx z_inv2 = z_inv * z_inv;
+    float gain = 1.0f;
+    cplx one = { 1.0f, 0.0f };
+
+    for (unsigned k = 0; k < MIC_BAND_SECTIONS; ++k)
+      {
+	cplx s = poles[k];
+	if (s.im < 0.0f)
+	  s.im = -s.im; // the conjugate belongs to the same section
+	cplx z = (one + s) / (one - s);
+	float c1 = -2.0f * z.re;
+	float c2 = z.re * z.re + z.im * z.im;
+	a1[k] = c1;
+	a2[k] = c2;
+	cplx denominator = one + cplx { c1, 0.0f } * z_inv + cplx { c2, 0.0f } * z_inv2;
+	cplx response = (one - z_inv2) / denominator;
+	gain /= hypotf (response.re, response.im);
+      }
+    gain_squared = gain * gain;
+
+    for (unsigned k = 0; k <= MIC_BAND_SECTIONS; ++k)
+      state[k][0] = state[k][1] = 0.0f;
+  }
+
+  //! @return unscaled output, multiply its mean square by gain_squared
+  float filter (float x)
+  {
+    float v = x;
+    for (unsigned k = 0; k < MIC_BAND_SECTIONS; ++k)
+      {
+	float y = v - state[k][1] - a1[k] * state[k + 1][0] - a2[k] * state[k + 1][1];
+	state[k][1] = state[k][0];
+	state[k][0] = v;
+	v = y;
+      }
+    state[MIC_BAND_SECTIONS][1] = state[MIC_BAND_SECTIONS][0];
+    state[MIC_BAND_SECTIONS][0] = v;
+    return v;
+  }
+
+  float gain_squared;
+
+private:
+  float a1[MIC_BAND_SECTIONS], a2[MIC_BAND_SECTIONS];
+  float state[MIC_BAND_SECTIONS + 1][2]; // node k: last two values
+};
+
 class microphone_analysis_t
 {
 public:
   microphone_analysis_t (float ENL_center_frequency = ENL_CENTER_FREQUENCY_HZ,
 			 float ENL_gain = ENL_DEFAULT_GAIN)
-  : ENL_gain (ENL_gain)
+  : ENL_gain (ENL_gain),
+    record_count (0)
   {
     ENL_stage[0].setup (ENL_center_frequency, ENL_FILTER_Q, MIC_SAMPLE_RATE_HZ);
     ENL_stage[1].setup (ENL_center_frequency, ENL_FILTER_Q, MIC_SAMPLE_RATE_HZ);
-    for (unsigned i = 0; i < MIC_OCTAVE_BANDS; ++i)
-      octave[i].setup (octave_center_frequency (i), MIC_OCTAVE_Q, MIC_SAMPLE_RATE_HZ);
+    for (unsigned i = 0; i < MIC_BANDS; ++i)
+      band[i].setup (band_center_frequency (i), MIC_SAMPLE_RATE_HZ);
     reset ();
   }
 
-  static float octave_center_frequency (unsigned band)
+  static float band_center_frequency (unsigned band)
   {
-    return 31.25f * (float) (1 << band); // nominal 31.5, 63, 125 ... 2000 Hz
+    return 1000.0f * powf (2.0f, ((float) band - (float) MIC_BAND_1KHZ) / 3.0f);
   }
 
-  //! restart after a gap in the sample stream
+  //! restart after a gap in the sample stream, record_count keeps counting
   void reset (void)
   {
     settling = MIC_SETTLING_SAMPLES;
@@ -126,15 +225,15 @@ public:
   {
     float x = (float) raw * (1.0f / 2147483648.0f);
 
-    // DC blocker, corner ~10 Hz
-    float hp = x - dc_x1 + 0.992f * dc_y1;
+    // DC blocker, corner ~2.5 Hz: keeps the 25 Hz band unattenuated
+    float hp = x - dc_x1 + 0.998f * dc_y1;
     dc_x1 = x;
     dc_y1 = hp;
 
     float enl = ENL_stage[1].filter (ENL_stage[0].filter (hp));
-    float band[MIC_OCTAVE_BANDS];
-    for (unsigned i = 0; i < MIC_OCTAVE_BANDS; ++i)
-      band[i] = octave[i].filter (hp);
+    float band_output[MIC_BANDS];
+    for (unsigned i = 0; i < MIC_BANDS; ++i)
+      band_output[i] = band[i].filter (hp);
 
     if (settling > 0)
       {
@@ -148,8 +247,8 @@ public:
       raw_max = raw;
     sum_broadband += hp * hp;
     sum_ENL += enl * enl;
-    for (unsigned i = 0; i < MIC_OCTAVE_BANDS; ++i)
-      sum_octave[i] += band[i] * band[i];
+    for (unsigned i = 0; i < MIC_BANDS; ++i)
+      sum_band[i] += band_output[i] * band_output[i];
 
     if (++count < MIC_RECORD_SAMPLES)
       return false;
@@ -174,8 +273,8 @@ private:
     raw_min = INT32_MAX;
     raw_max = INT32_MIN;
     sum_broadband = sum_ENL = 0.0f;
-    for (unsigned i = 0; i < MIC_OCTAVE_BANDS; ++i)
-      sum_octave[i] = 0.0f;
+    for (unsigned i = 0; i < MIC_BANDS; ++i)
+      sum_band[i] = 0.0f;
   }
 
   void finish_record (void)
@@ -200,23 +299,30 @@ private:
 	float value = (float) ENL_BASELINE + ENL_gain * sqrtf (mean_square);
 	record.ENL = value >= (float) ENL_MAXIMUM ? ENL_MAXIMUM : (uint32_t) value;
       }
+    record.record_count = ++record_count;
     record.status = no_signal ? MIC_STATUS_NO_SIGNAL : 0;
     record.ENL_band_dBFS = dBFS (sum_ENL);
     record.broadband_dBFS = dBFS (sum_broadband);
-    for (unsigned i = 0; i < MIC_OCTAVE_BANDS; ++i)
-      record.octave_dBFS[i] = dBFS (sum_octave[i]);
+
+    // |INT32_MIN| does not fit into int32_t
+    float peak = fmaxf (-(float) raw_min, (float) raw_max) * (1.0f / 2147483648.0f);
+    record.peak_dBFS = 20.0f * log10f (peak + 1e-10f);
+
+    for (unsigned i = 0; i < MIC_BANDS; ++i)
+      record.band_dBFS[i] = dBFS (sum_band[i] * band[i].gain_squared);
 
     clear_accumulators ();
   }
 
   mic_biquad_t ENL_stage[2];
-  mic_biquad_t octave[MIC_OCTAVE_BANDS];
+  mic_third_octave_t band[MIC_BANDS];
   float ENL_gain;
+  uint32_t record_count;
   unsigned settling;
   float dc_x1, dc_y1;
   unsigned count;
   int32_t raw_min, raw_max;
-  float sum_broadband, sum_ENL, sum_octave[MIC_OCTAVE_BANDS];
+  float sum_broadband, sum_ENL, sum_band[MIC_BANDS];
   float ENL_mean_square[ENL_WINDOW_RECORDS];
   unsigned filled_records;
   unsigned next_ENL_slot;
